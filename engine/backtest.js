@@ -40,6 +40,56 @@ function buildSignal(rows, strategy) {
   return signal;
 }
 
+// 波动状态：以「ATR / ATR 的均值」衡量当前波动相对近期常态的位置。
+// 全部基于截至当根 K 线收盘已知的数据，状态用于下一根 K 线的入场决策。
+// ratio 为 null（ATR 或其均值尚不可得）时按"正常"处理。
+function volStateSeries(atrArr, win, lowK, highK) {
+  const avg = ind.sma(atrArr.map(v => (v == null ? 0 : v)), win);
+  return atrArr.map((v, i) => {
+    let ratio = null;
+    if (v != null && avg[i] != null && avg[i] > 0) ratio = v / avg[i];
+    const state = ratio == null ? "正常" : ratio <= lowK ? "低波动" : ratio >= highK ? "高波动" : "正常";
+    return { state, ratio };
+  });
+}
+
+function stateMult(state, lowM, highM) {
+  if (state === "高波动") return highM;
+  if (state === "低波动") return lowM;
+  return 1;
+}
+
+// 入场当日锁定止损/止盈触发价。
+// fixed：入场价 ± 固定比例，与历史行为完全一致。
+// atr：距离 = ATR(refIdx) × 倍数 × 波动状态乘数；refIdx 为入场前一根，杜绝前视。
+//      若入场前 ATR 尚不可得（数据预热期），回退到固定比例（可为 0 表示不设）。
+function resolveStops(o) {
+  const mode = o.mode === "atr" ? "atr" : "fixed";
+  const ref = o.atrArr[o.refIdx];
+  const vs = o.volArr[o.refIdx] || { state: "正常", ratio: null };
+  const mult = stateMult(vs.state, o.lowMult, o.highMult);
+  let stopPrice = 0;
+  let targetPrice = 0;
+  let atrUsed = null;
+  if (mode === "atr" && ref != null && ref > 0) {
+    atrUsed = ref;
+    if (o.atrStopMult > 0) stopPrice = o.entryPrice - ref * o.atrStopMult * mult;
+    if (o.atrTargetMult > 0) targetPrice = o.entryPrice + ref * o.atrTargetMult * mult;
+  } else {
+    if (o.stopLoss > 0) stopPrice = o.entryPrice * (1 - o.stopLoss);
+    if (o.takeProfit > 0) targetPrice = o.entryPrice * (1 + o.takeProfit);
+  }
+  return {
+    mode,
+    stopPrice,
+    targetPrice,
+    atrRef: atrUsed,
+    volState: vs.state,
+    volRatio: vs.ratio,
+    volMult: atrUsed == null ? 1 : mult,
+  };
+}
+
 function backtest(market, opts, signalOverride) {
   const rows = market.rows;
   const n = rows.length;
@@ -52,48 +102,73 @@ function backtest(market, opts, signalOverride) {
   const positionRatio = opts2.positionRatio == null ? 1 : Math.max(0, Math.min(1, opts2.positionRatio));
   const signal = signalOverride || buildSignal(rows, opts2.strategy);
 
+  // 止损止盈模式：默认 fixed，保持旧参数可复现；atr 为按 ATR + 波动状态动态调整
+  const stopMode = opts2.stopMode === "atr" ? "atr" : "fixed";
+  const atrN = Math.max(2, opts2.atrN || 14);
+  const atrStopMult = opts2.atrStopMult == null ? 2 : opts2.atrStopMult;
+  const atrTargetMult = opts2.atrTargetMult == null ? 4 : opts2.atrTargetMult;
+  const atrVolN = Math.max(2, opts2.atrVolN || 50);
+  const volLowK = opts2.volLowK == null ? 0.7 : opts2.volLowK;
+  const volHighK = opts2.volHighK == null ? 1.3 : opts2.volHighK;
+  const volLowMult = opts2.volLowMult == null ? 0.8 : opts2.volLowMult;
+  const volHighMult = opts2.volHighMult == null ? 1.5 : opts2.volHighMult;
+
+  const atrArr = ind.atr(rows, atrN);
+  const volArr = volStateSeries(atrArr, atrVolN, volLowK, volHighK);
+
   let cash = cash0;
   let shares = 0;
   let inPos = false;
   let entryPrice = 0;
   let entryIdx = 0;
   let stopOutBar = -1;
+  let curStops = null;
   const equity = new Array(n).fill(null);
   const trades = [];
+
+  function closeTrade(exitIdx, exitPrice, reason) {
+    const px = exitPrice * (1 - slippage);
+    cash = shares * px - shares * px * feeRate;
+    trades.push({
+      entry_idx: entryIdx,
+      exit_idx: exitIdx,
+      entry_date: rows[entryIdx].date,
+      exit_date: rows[exitIdx].date,
+      entry_price: entryPrice,
+      exit_price: exitPrice,
+      stop_price: curStops ? curStops.stopPrice : 0,
+      target_price: curStops ? curStops.targetPrice : 0,
+      stop_mode: curStops ? curStops.mode : stopMode,
+      atr_ref: curStops ? curStops.atrRef : null,
+      vol_state: curStops ? curStops.volState : "正常",
+      vol_mult: curStops ? curStops.volMult : 1,
+      reason,
+      shares,
+      pnl: shares * exitPrice * (1 - slippage) - shares * entryPrice * (1 + slippage) - shares * exitPrice * feeRate - shares * entryPrice * feeRate,
+      hold_bars: exitIdx - entryIdx,
+    });
+    shares = 0;
+    inPos = false;
+    curStops = null;
+    if (reason === "止损" || reason === "止盈") stopOutBar = exitIdx;
+  }
 
   for (let i = 0; i < n; i++) {
     const bar = rows[i];
     if (inPos) {
-      const sl = entryPrice * (1 - stopLoss);
-      const tp = entryPrice * (1 + takeProfit);
+      const sl = curStops.stopPrice;
+      const tp = curStops.targetPrice;
       let exitPrice = null;
       let reason = null;
-      if (stopLoss > 0 && bar.low <= sl) {
+      // 同一根 K 线内先判止损再判止盈；跳空越过触发价按开盘价成交
+      if (sl > 0 && bar.low <= sl) {
         exitPrice = bar.open < sl ? bar.open : sl;
         reason = "止损";
-      } else if (takeProfit > 0 && bar.high >= tp) {
+      } else if (tp > 0 && bar.high >= tp) {
         exitPrice = bar.open > tp ? bar.open : tp;
         reason = "止盈";
       }
-      if (exitPrice != null) {
-        const px = exitPrice * (1 - slippage);
-        cash = shares * px - shares * px * feeRate;
-        trades.push({
-          entry_idx: entryIdx,
-          exit_idx: i,
-          entry_date: rows[entryIdx].date,
-          exit_date: bar.date,
-          entry_price: entryPrice,
-          exit_price: exitPrice,
-          reason,
-          shares,
-          pnl: shares * exitPrice * (1 - slippage) - shares * entryPrice * (1 + slippage) - shares * exitPrice * feeRate - shares * entryPrice * feeRate,
-          hold_bars: i - entryIdx,
-        });
-        shares = 0;
-        inPos = false;
-        stopOutBar = i;
-      }
+      if (exitPrice != null) closeTrade(i, exitPrice, reason);
     }
     const target = i > 0 ? signal[i - 1] : 0;
     const desired = target >= 0.5 ? positionRatio : 0;
@@ -107,24 +182,22 @@ function backtest(market, opts, signalOverride) {
         inPos = true;
         entryPrice = bar.open;
         entryIdx = i;
+        curStops = resolveStops({
+          mode: stopMode,
+          entryPrice,
+          refIdx: i - 1,
+          atrArr,
+          volArr,
+          stopLoss,
+          takeProfit,
+          atrStopMult,
+          atrTargetMult,
+          lowMult: volLowMult,
+          highMult: volHighMult,
+        });
       }
     } else if (desired === 0 && inPos) {
-      const px = bar.open * (1 - slippage);
-      cash = shares * px - shares * px * feeRate;
-      trades.push({
-        entry_idx: entryIdx,
-        exit_idx: i,
-        entry_date: rows[entryIdx].date,
-        exit_date: bar.date,
-        entry_price: entryPrice,
-        exit_price: bar.open,
-        reason: "信号平仓",
-        shares,
-        pnl: shares * bar.open * (1 - slippage) - shares * entryPrice * (1 + slippage) - shares * bar.open * feeRate - shares * entryPrice * feeRate,
-        hold_bars: i - entryIdx,
-      });
-      shares = 0;
-      inPos = false;
+      closeTrade(i, bar.open, "信号平仓");
     }
     equity[i] = cash + shares * bar.close;
   }
@@ -150,4 +223,4 @@ function computeDrawdown(equity) {
   return out;
 }
 
-module.exports = { backtest, buildSignal, computeDrawdown };
+module.exports = { backtest, buildSignal, computeDrawdown, volStateSeries, resolveStops };

@@ -20,6 +20,7 @@ body { background: var(--bg); color: var(--txt); font-family: "PingFang SC", "Mi
 .panel label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; color: var(--dim); font-size: 12px; }
 .panel input, .panel select { width: 130px; background: var(--panel2); border: 1px solid var(--line); color: var(--txt); border-radius: 6px; padding: 5px 8px; font-size: 12px; }
 .panel input[type="range"] { width: 90px; padding: 0; }
+.panel .hint { margin: 6px 0 2px; font-size: 11px; line-height: 1.5; color: var(--dim); opacity: .8; }
 .stats-row { display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; padding: 0 22px 14px; }
 .stat-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; text-align: center; }
 .stat-v { font-size: 17px; font-weight: 700; }

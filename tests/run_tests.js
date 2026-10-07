@@ -234,5 +234,104 @@ t("回测总体运行无异常", () => {
   assert(Number.isFinite(s.sharpe));
 });
 
+t("旧参数（固定止损止盈）结果逐位复现", () => {
+  const m = market.generateMarket({ seed: 21, days: 600 });
+  const r = bt.backtest(m, {
+    cash: 100000, feeRate: 0.0005, slippageBp: 5, stopLoss: 0.05, takeProfit: 0.2,
+    strategy: { type: "boll", bbN: 20, bbK: 2 },
+  });
+  assert.strictEqual(r.trades.length, 9);
+  assert.strictEqual(r.final_equity, 117293.21490464684);
+  assert.strictEqual(r.equity[300], 118780.39399849842);
+  // 固定模式同样输出统一字段，历史解释一致
+  const t0 = r.trades[0];
+  assert.strictEqual(t0.stop_mode, "fixed");
+  assert.strictEqual(t0.atr_ref, null);
+  assert.strictEqual(t0.reason, "止损");
+  assert(Math.abs(t0.stop_price - t0.entry_price * 0.95) < 1e-9);
+});
+
+t("ATR 模式按入场前 ATR 计算触发价", () => {
+  // TR 恒为 2，ATR=2；i=19 以 open=119 入场，refIdx=18
+  const rows = Array.from({ length: 20 }, (_, i) => ({ date: "d" + i, open: 100 + i, high: 101 + i, low: 99 + i, close: 100 + i, volume: 1 }));
+  rows.push({ date: "d20", open: 119, high: 120, low: 114, close: 115, volume: 1 });
+  const signal = new Array(20).fill(0).concat([1]);
+  signal[18] = 1;
+  const r = bt.backtest({ rows }, { cash: 100000, feeRate: 0, slippageBp: 0, stopMode: "atr", atrStopMult: 2, atrTargetMult: 4, strategy: {} }, signal);
+  assert.strictEqual(r.trades.length, 1);
+  assert.strictEqual(r.trades[0].reason, "止损");
+  assert.strictEqual(r.trades[0].stop_mode, "atr");
+  assert.strictEqual(r.trades[0].atr_ref, 2);
+  assert.strictEqual(r.trades[0].stop_price, 115);
+  assert.strictEqual(r.trades[0].exit_price, 115);
+});
+
+t("ATR 模式跳空越过止损按开盘价成交", () => {
+  const rows = Array.from({ length: 20 }, (_, i) => ({ date: "d" + i, open: 100 + i, high: 101 + i, low: 99 + i, close: 100 + i, volume: 1 }));
+  rows.push({ date: "d20", open: 110, high: 111, low: 109, close: 110, volume: 1 }); // 开盘 110 < 止损 115
+  const signal = new Array(20).fill(0).concat([1]);
+  signal[18] = 1;
+  const r = bt.backtest({ rows }, { cash: 100000, feeRate: 0, slippageBp: 0, stopMode: "atr", atrStopMult: 2, strategy: {} }, signal);
+  assert.strictEqual(r.trades[0].reason, "止损");
+  assert.strictEqual(r.trades[0].exit_price, 110);
+});
+
+t("高波动状态放宽止损止盈距离", () => {
+  const atrArr = Array.from({ length: 40 }, () => 1).concat(Array.from({ length: 10 }, () => 1.5));
+  const volArr = bt.volStateSeries(atrArr, 50, 0.7, 1.3);
+  assert.strictEqual(volArr[49].state, "高波动");
+  const s = bt.resolveStops({
+    mode: "atr", entryPrice: 100, refIdx: 49, atrArr, volArr,
+    stopLoss: 0, takeProfit: 0, atrStopMult: 2, atrTargetMult: 4, lowMult: 0.8, highMult: 1.5,
+  });
+  assert.strictEqual(s.volMult, 1.5);
+  assert.strictEqual(s.stopPrice, 95.5);   // 100 - 1.5*2*1.5
+  assert.strictEqual(s.targetPrice, 109);    // 100 + 1.5*4*1.5
+});
+
+t("ATR 预热期数据不足时回退固定比例", () => {
+  const atrArr = new Array(50).fill(null);
+  const volArr = bt.volStateSeries(atrArr, 50, 0.7, 1.3);
+  const s = bt.resolveStops({
+    mode: "atr", entryPrice: 100, refIdx: 5, atrArr, volArr,
+    stopLoss: 0.05, takeProfit: 0.2, atrStopMult: 2, atrTargetMult: 4, lowMult: 0.8, highMult: 1.5,
+  });
+  assert.strictEqual(s.atrRef, null);
+  assert.strictEqual(s.stopPrice, 95);
+  assert.strictEqual(s.targetPrice, 120);
+});
+
+t("ATR 模式不使用未来数据（截断行情结果一致）", () => {
+  const m = market.generateMarket({ seed: 5, days: 500 });
+  const opts = { cash: 100000, feeRate: 0.0005, slippageBp: 5, stopMode: "atr", strategy: { type: "ma_cross", fast: 10, slow: 30 } };
+  const full = bt.backtest(m, opts);
+  const cut = { rows: m.rows.slice(0, 200) };
+  const r2 = bt.backtest(cut, opts);
+  for (let i = 0; i < 200; i++) assert.strictEqual(r2.equity[i], full.equity[i]);
+  // 所有 ATR 交易引用的 ATR 都来自入场之前
+  for (const tr of full.trades) {
+    if (tr.stop_mode !== "atr" || tr.atr_ref == null) continue;
+    assert(tr.entry_idx >= 1);
+  }
+});
+
+t("ATR 模式全链路回测与风险指标正常", () => {
+  const m = market.generateMarket({ seed: 11, days: 800, vol: 0.018 });
+  const r = bt.backtest(m, {
+    cash: 100000, feeRate: 0.0005, slippageBp: 5, stopMode: "atr",
+    atrN: 14, atrStopMult: 2, atrTargetMult: 4, atrVolN: 50,
+    strategy: { type: "boll", bbN: 20, bbK: 2 },
+  });
+  assert.strictEqual(r.equity.length, 800);
+  assert(Number.isFinite(r.final_equity));
+  for (const tr of r.trades) {
+    assert(["止损", "止盈", "信号平仓"].includes(tr.reason));
+    assert(["低波动", "正常", "高波动"].includes(tr.vol_state));
+    assert(tr.stop_price >= 0 && tr.target_price >= 0);
+  }
+  const s = metrics.summarize(r.equity, {});
+  assert(Number.isFinite(s.sharpe) && Number.isFinite(s.max_drawdown));
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

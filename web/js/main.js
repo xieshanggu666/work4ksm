@@ -17,7 +17,11 @@ const app = createApp({
       busy: false,
       market: { seed: 42, days: 400, start: 100, drift: 0.0004, vol: 0.012 },
       strategy: { type: "ma_cross", fast: 10, slow: 30, rsiN: 14, rsiBuy: 30, rsiSell: 70, bbN: 20, bbK: 2 },
-      trade: { cash: 100000, feeRate: 0.0005, slippageBp: 5, stopLoss: 0.05, takeProfit: 0.15, positionRatio: 1 },
+      trade: {
+        cash: 100000, feeRate: 0.0005, slippageBp: 5, positionRatio: 1,
+        stopMode: "fixed", stopLoss: 0.05, takeProfit: 0.15,
+        atrN: 14, atrStopMult: 2, atrTargetMult: 4, atrVolN: 50, volLowMult: 0.8, volHighMult: 1.5,
+      },
       stats: null,
       trades: [],
       equity: null,
