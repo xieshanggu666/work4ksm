@@ -234,5 +234,119 @@ t("回测总体运行无异常", () => {
   assert(Number.isFinite(s.sharpe));
 });
 
+// 构造 ATR 测试数据：atrN=3，平稳段 H11 L9 C10（TR=2，ATR 收敛于 2）
+function calmBar() { return { date: "d", open: 10, high: 11, low: 9, close: 10, volume: 1 }; }
+
+t("ATR 止损触发且跟踪最高价上移", () => {
+  const rows = [calmBar(), calmBar(), calmBar(), calmBar(), calmBar(),
+    { date: "d5", open: 10, high: 10.5, low: 6.5, close: 9, volume: 1 }];
+  const signal = [0, 0, 1, 1, 1, 1];
+  const r = bt.backtest({ rows }, {
+    cash: 10000, feeRate: 0, slippageBp: 0, strategy: {},
+    stopMode: "atr", atrN: 3, atrStopMult: 2, volState: false,
+  }, signal);
+  assert.strictEqual(r.trades.length, 1);
+  const tr = r.trades[0];
+  assert.strictEqual(tr.reason, "止损");
+  // 入场价 10，初始止损 10-2*2=6；bar3/bar4 最高 11 把止损上移至 11-2*2=7
+  assert.strictEqual(tr.exit_price, 7);
+  assert.strictEqual(tr.stop_price, 7);
+  assert.strictEqual(tr.atr, 2);
+  assert.strictEqual(tr.vol_scale, 1);
+  assert.strictEqual(tr.stop_mode, "atr");
+});
+
+t("ATR 止盈按入场价+倍数*ATR 触发", () => {
+  const rows = [calmBar(), calmBar(), calmBar(), calmBar(),
+    { date: "d4", open: 10, high: 17, low: 9.5, close: 15, volume: 1 }];
+  const signal = [0, 0, 1, 1, 1];
+  const r = bt.backtest({ rows }, {
+    cash: 10000, feeRate: 0, slippageBp: 0, strategy: {},
+    stopMode: "atr", atrN: 3, atrStopMult: 0, atrTakeMult: 3, volState: false,
+  }, signal);
+  assert.strictEqual(r.trades.length, 1);
+  assert.strictEqual(r.trades[0].reason, "止盈");
+  assert.strictEqual(r.trades[0].exit_price, 16); // 10 + 3*2
+  assert.strictEqual(r.trades[0].take_price, 16);
+});
+
+t("ATR 止损跳空按开盘价成交", () => {
+  const rows = [calmBar(), calmBar(), calmBar(), calmBar(), calmBar(),
+    { date: "d5", open: 5, high: 5.5, low: 4, close: 4.5, volume: 1 }];
+  const signal = [0, 0, 1, 1, 1, 1];
+  const r = bt.backtest({ rows }, {
+    cash: 10000, feeRate: 0, slippageBp: 0, strategy: {},
+    stopMode: "atr", atrN: 3, atrStopMult: 2, volState: false,
+  }, signal);
+  assert.strictEqual(r.trades.length, 1);
+  assert.strictEqual(r.trades[0].reason, "止损");
+  assert.strictEqual(r.trades[0].exit_price, 5); // 开盘 5 低于止损位 7，按开盘价
+});
+
+t("波动状态缩放系数截断正确", () => {
+  const s = bt.volStateScale([2, 2, 2, 2, 4, 1], 3, 0.5, 2);
+  assert.strictEqual(s[0], null); // 无历史基准
+  assert.strictEqual(s[1], 1);
+  assert.strictEqual(s[3], 1);
+  assert.strictEqual(s[4], 2);   // 4/2=2，触及上限
+  assert.strictEqual(s[5], 0.5); // 1/(8/3)=0.375，截断到下限
+});
+
+t("高波动状态下 ATR 止损更宽", () => {
+  const rows = [];
+  for (let i = 0; i < 80; i++) rows.push(calmBar());
+  for (let i = 0; i < 9; i++) rows.push({ date: "w" + i, open: 10, high: 14, low: 6, close: 10, volume: 1 });
+  rows.push(calmBar()); // bar 89：入场
+  rows.push(calmBar()); // bar 90：信号平仓
+  const signal = new Array(rows.length).fill(0);
+  signal[88] = 1;
+  const atrArr = ind.atr(rows, 3);
+  const base = { cash: 10000, feeRate: 0, slippageBp: 0, strategy: {}, stopMode: "atr", atrN: 3, atrStopMult: 2, volLookback: 60 };
+  const on = bt.backtest({ rows }, { ...base, volState: true }, signal);
+  const off = bt.backtest({ rows }, { ...base, volState: false }, signal);
+  assert.strictEqual(on.trades.length, 1);
+  assert.strictEqual(off.trades.length, 1);
+  const tOn = on.trades[0];
+  const tOff = off.trades[0];
+  assert.strictEqual(tOn.vol_scale, 2); // 高波动，缩放触及上限
+  // bar90 止损位 = 持仓内最高 11 - 2*scale*atr[89]
+  assert(Math.abs(tOff.stop_price - (11 - 2 * atrArr[89])) < 1e-9);
+  assert(Math.abs(tOn.stop_price - (11 - 4 * atrArr[89])) < 1e-9);
+  assert(tOn.stop_price < tOff.stop_price);
+});
+
+t("旧参数缺省 stopMode 复现原结果", () => {
+  const m = market.generateMarket({ seed: 21, days: 600 });
+  const oldOpts = {
+    cash: 100000, feeRate: 0.0005, slippageBp: 5, stopLoss: 0.05, takeProfit: 0.2,
+    strategy: { type: "boll", bbN: 20, bbK: 2 },
+  };
+  const a = bt.backtest(m, oldOpts);
+  // 显式 fixed + 混入 ATR 参数，结果必须逐位一致
+  const b = bt.backtest(m, { ...oldOpts, stopMode: "fixed", atrN: 10, atrStopMult: 3, atrTakeMult: 4, volState: true });
+  assert.deepStrictEqual(a.equity, b.equity);
+  assert.deepStrictEqual(a.trades, b.trades);
+  assert.strictEqual(a.final_equity, b.final_equity);
+});
+
+t("ATR 模式在模拟行情上运行且明细含波动字段", () => {
+  const m = market.generateMarket({ seed: 21, days: 600 });
+  const r = bt.backtest(m, {
+    cash: 100000, feeRate: 0.0005, slippageBp: 5,
+    stopMode: "atr", atrN: 14, atrStopMult: 2, atrTakeMult: 3, volState: true,
+    strategy: { type: "ma_cross", fast: 10, slow: 30 },
+  });
+  assert.strictEqual(r.equity.length, 600);
+  assert(Number.isFinite(r.final_equity));
+  assert(r.trades.length > 0);
+  for (const tr of r.trades) {
+    assert.strictEqual(tr.stop_mode, "atr");
+    assert(tr.atr == null || tr.atr > 0);
+    assert(tr.vol_scale == null || (tr.vol_scale >= 0.5 && tr.vol_scale <= 2));
+  }
+  const s = metrics.summarize(r.equity, {});
+  assert(Number.isFinite(s.sharpe));
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

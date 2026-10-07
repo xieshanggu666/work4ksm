@@ -62,8 +62,23 @@
         <label>初始资金 <input type="number" v-model.number="trade.cash" step="1000"></label>
         <label>手续费率 <input type="number" v-model.number="trade.feeRate" step="0.0001"></label>
         <label>滑点(bp) <input type="number" v-model.number="trade.slippageBp" step="1"></label>
-        <label>止损比例 <input type="number" v-model.number="trade.stopLoss" step="0.01"></label>
-        <label>止盈比例 <input type="number" v-model.number="trade.takeProfit" step="0.01"></label>
+        <label>止损模式
+          <select v-model="trade.stopMode">
+            <option value="fixed">固定比例</option>
+            <option value="atr">ATR 动态</option>
+          </select>
+        </label>
+        <template v-if="trade.stopMode === 'fixed'">
+          <label>止损比例 <input type="number" v-model.number="trade.stopLoss" step="0.01"></label>
+          <label>止盈比例 <input type="number" v-model.number="trade.takeProfit" step="0.01"></label>
+        </template>
+        <template v-else>
+          <label>ATR 周期 <input type="number" v-model.number="trade.atrN" step="1" min="1"></label>
+          <label>止损 ATR 倍数 <input type="number" v-model.number="trade.atrStopMult" step="0.1" min="0"></label>
+          <label>止盈 ATR 倍数 <input type="number" v-model.number="trade.atrTakeMult" step="0.1" min="0"></label>
+          <label>波动状态调整 <input type="checkbox" v-model="trade.volState"></label>
+          <label v-if="trade.volState">波动基准窗口 <input type="number" v-model.number="trade.volLookback" step="1" min="2"></label>
+        </template>
         <label>仓位比例 <input type="range" min="0.1" max="1" step="0.05" v-model.number="trade.positionRatio"> {{ (trade.positionRatio*100).toFixed(0) }}%</label>
       </section>
     </div>
@@ -99,11 +114,13 @@
       <h3>逐笔交易（{{ trades.length }} 笔）</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>#</th><th>买入日</th><th>卖出日</th><th>买入价</th><th>卖出价</th><th>股数</th><th>盈亏</th><th>持有(bar)</th><th>原因</th></tr></thead>
+          <thead><tr><th>#</th><th>买入日</th><th>卖出日</th><th>买入价</th><th>卖出价</th><th>止损价</th><th>止盈价</th><th>股数</th><th>盈亏</th><th>持有(bar)</th><th>原因</th></tr></thead>
           <tbody>
             <tr v-for="(t, i) in trades" :key="i">
               <td>{{ i + 1 }}</td><td>{{ t.entry_date }}</td><td>{{ t.exit_date }}</td>
               <td>{{ t.entry_price.toFixed(2) }}</td><td>{{ t.exit_price.toFixed(2) }}</td>
+              <td>{{ t.stop_price == null ? '—' : t.stop_price.toFixed(2) }}</td>
+              <td>{{ t.take_price == null ? '—' : t.take_price.toFixed(2) }}</td>
               <td>{{ t.shares }}</td>
               <td :class="t.pnl >= 0 ? 'up' : 'down'">{{ t.pnl.toFixed(0) }}</td>
               <td>{{ t.hold_bars }}</td><td>{{ t.reason }}</td>
